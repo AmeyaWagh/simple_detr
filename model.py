@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import torch
 from torch import nn
@@ -67,11 +67,11 @@ class TransformerEncoderLayer(nn.Module):
         self.activation = F.relu
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.norm1(x + self._sa_block(x))
-        x = self.norm2(x + self._ff_block(x))
+        x = self.norm1(x + self._self_attention_block(x))
+        x = self.norm2(x + self._feedforward_block(x))
         return x
 
-    def _sa_block(
+    def _self_attention_block(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
@@ -84,7 +84,7 @@ class TransformerEncoderLayer(nn.Module):
         return self.dropout1(x)
 
     # feed forward block
-    def _ff_block(self, x: torch.Tensor) -> torch.Tensor:
+    def _feedforward_block(self, x: torch.Tensor) -> torch.Tensor:
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
         return self.dropout2(x)
 
@@ -116,8 +116,73 @@ class TransformerEncoder(nn.Module):
 
 
 class TransformerDecoderLayer(nn.Module):
-    def __init__(self):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        layer_norm_eps: float = 1e-5,
+    ):
         super().__init__()
+        self.self_attn = nn.MultiheadAttention(
+            hidden_dim, num_heads, dropout=dropout, batch_first=False
+        )
+        self.multihead_attn = nn.MultiheadAttention(
+            hidden_dim, num_heads, dropout=dropout, batch_first=False
+        )
+
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(hidden_dim, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, hidden_dim)
+
+        self.norm1 = LayerNorm(hidden_dim, eps=layer_norm_eps)
+        self.norm2 = LayerNorm(hidden_dim, eps=layer_norm_eps)
+        self.norm3 = LayerNorm(hidden_dim, eps=layer_norm_eps)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+        self.activation = F.relu
+
+    def forward(self, x: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        x = self.norm1(x + self._self_attention_block(x))
+        x = self.norm2(x + self._multi_head_attention_block(x, memory))
+        x = self.norm3(x + self._feedforward_block(x))
+
+        return x
+
+    # self-attention block
+    def _self_attention_block(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        x = self.self_attn(
+            query=x,
+            key=x,
+            value=x,
+            need_weights=False,
+        )[0]
+        return self.dropout1(x)
+
+    # multihead attention block
+    def _multi_head_attention_block(
+        self,
+        x: torch.Tensor,
+        memory: torch.Tensor,
+    ) -> torch.Tensor:
+        x = self.multihead_attn(
+            x,
+            memory,
+            memory,
+            need_weights=False,
+        )[0]
+        return self.dropout2(x)
+
+    # feed forward block
+    def _feedforward_block(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        return self.dropout3(x)
 
 
 class TransformerDecoder(nn.Module):
@@ -132,7 +197,7 @@ class TransformerDecoder(nn.Module):
         self.layers = []
         for _ in range(num_layers):
             self.layers.append(
-                nn.TransformerDecoderLayer(
+                TransformerDecoderLayer(
                     num_hidden_dims, num_heads, dim_feedforward=dim_feedforward
                 )
             )
@@ -141,8 +206,8 @@ class TransformerDecoder(nn.Module):
         self.norm = LayerNorm(num_hidden_dims)
 
     def forward(self, x: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
-        for mod in self.layers:
-            x = mod(x, memory)
+        for layer in self.layers:
+            x = layer(x, memory)
         x = self.norm(x)
         return x
 
