@@ -1,10 +1,9 @@
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
-from torchvision.models import resnet50
-import torchvision.transforms as T
 import torch.nn.functional as F
+from torchvision.models import resnet50
 
 
 class LayerNorm(nn.Module):
@@ -34,11 +33,63 @@ class LayerNorm(nn.Module):
 
 
 class MultiheadAttention(nn.Module):
-    def __init__(self):
+    def __init__(self, embed_dim, num_heads, dropout=0.0, batch_first=False):
         super().__init__()
+        self.embed_dim = embed_dim
+        self.kdim = embed_dim
+        self.vdim = embed_dim
+        self._qkv_same_embed_dim = self.kdim == embed_dim and self.vdim == embed_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.batch_first = False
+        self.head_dim = embed_dim // num_heads
+        assert (
+            self.head_dim * num_heads == self.embed_dim
+        ), "embed_dim must be divisible by num_heads"
 
-    def forward(self, x) -> torch.Tensor:
-        pass
+        # self.q_proj_weight = nn.Parameter(torch.empty((embed_dim, embed_dim)))
+        # self.k_proj_weight = nn.Parameter(torch.empty((embed_dim, self.kdim)))
+        # self.v_proj_weight = nn.Parameter(torch.empty((embed_dim, self.vdim)))
+
+        self.in_proj_weight = nn.Parameter(torch.empty((3 * embed_dim, embed_dim)))
+        self.in_proj_bias = nn.Parameter(torch.empty(3 * embed_dim))
+        self.bias_k = self.bias_v = None
+        self.add_zero_attn = False
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        need_weights=True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+
+        attn_output, attn_output_weights = F.multi_head_attention_forward(
+            query,
+            key,
+            value,
+            self.embed_dim,
+            self.num_heads,
+            self.in_proj_weight,
+            self.in_proj_bias,
+            self.bias_k,
+            self.bias_v,
+            self.add_zero_attn,
+            self.dropout,
+            self.out_proj.weight,
+            self.out_proj.bias,
+            training=self.training,
+            key_padding_mask=None,
+            need_weights=need_weights,
+            attn_mask=None,
+            use_separate_proj_weight=False,
+            q_proj_weight=None,
+            k_proj_weight=None,
+            v_proj_weight=None,
+            average_attn_weights=True,
+        )
+        return attn_output, attn_output_weights
 
 
 class TransformerEncoderLayer(nn.Module):
@@ -51,7 +102,7 @@ class TransformerEncoderLayer(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(
+        self.self_attn = MultiheadAttention(
             hidden_dim, num_heads, dropout=dropout, batch_first=False
         )
 
@@ -125,10 +176,10 @@ class TransformerDecoderLayer(nn.Module):
         layer_norm_eps: float = 1e-5,
     ):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(
+        self.self_attn = MultiheadAttention(
             hidden_dim, num_heads, dropout=dropout, batch_first=False
         )
-        self.multihead_attn = nn.MultiheadAttention(
+        self.multihead_attn = MultiheadAttention(
             hidden_dim, num_heads, dropout=dropout, batch_first=False
         )
 
