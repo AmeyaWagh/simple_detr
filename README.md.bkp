@@ -1,0 +1,7 @@
+# A Pure pytorch implementation of DETR
+
+Implementing DETR in pure pytorch without using any pre-implemented transformers.
+
+This is intended to learn and understand the DETR implementation.
+
+This is based on the original implementation of DETR.
