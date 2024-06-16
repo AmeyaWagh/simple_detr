@@ -1,4 +1,5 @@
 import logging
+from typing import Callable
 
 from PIL import Image
 import torch
@@ -15,7 +16,7 @@ class Detector:
     """2D Object detector."""
 
     def __init__(self, threshold: float = 0.7) -> None:
-        self.transform = T.Compose(
+        self.transform: Callable[[Image.Image], torch.Tensor] = T.Compose(
             [
                 T.Resize(800),
                 T.ToTensor(),

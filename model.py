@@ -42,7 +42,7 @@ class SimpleDETR(nn.Module):
         # create conversion layer
         self.conv = nn.Conv2d(image_feature_dim, hidden_dim, 1)
 
-        # create a default PyTorch transformer
+        # create a Simple transformer
         self.transformer = SimpleTransformer(
             hidden_dim, num_heads, num_encoder_layers, num_decoder_layers
         )
@@ -66,7 +66,14 @@ class SimpleDETR(nn.Module):
         )
 
     def _image_encoder_forward(self, image: torch.Tensor) -> torch.Tensor:
-        # propagate inputs through ResNet-50 up to avg-pool layer
+        """Propagae image through Resnet-50 backbone.
+
+        Args:
+            image (torch.Tensor): image tensor of shape B,3,H,W
+
+        Returns:
+            torch.Tensor: image features output shape B,C,fH,fW
+        """
         # inputs shape B,3,H,W
         x = self.backbone.conv1(image)
         x = self.backbone.bn1(x)
@@ -78,6 +85,7 @@ class SimpleDETR(nn.Module):
         x = self.backbone.layer3(x)
         x = self.backbone.layer4(x)
 
+        # convert from 2048 to 256 feature planes for the transformer
         x = self.conv(x)
         return x  # output shape B,C,fH,fW
 
@@ -107,7 +115,7 @@ class SimpleDETR(nn.Module):
         logger.info("image shape:%s", str(image.shape))
 
         image_features = self._image_encoder_forward(image)
-        # convert from 2048 to 256 feature planes for the transformer
+
         logger.info("Image feature shape %s", str(image_features.shape))
 
         # construct positional encodings
@@ -128,11 +136,6 @@ class SimpleDETR(nn.Module):
         logits = self.linear_class(outputs)
         boxes = self.linear_bbox(outputs).sigmoid()
         return Predictions(logits=logits, boxes=boxes)
-
-    def infer(self, image: torch.Tensor, threshold: float = 0.7):
-        outputs: Predictions = self.forward(image)
-        probas = outputs.logits.softmax(-1)[0, :, :-1]
-        keep = probas.max(-1).values > threshold
 
 
 class SimpleTransformer(nn.Module):
@@ -167,11 +170,11 @@ class SimpleTransformer(nn.Module):
         """
 
         # Encode the embedding in latent space using Transformer encoder.
-        memory = self.encoder(embeddings)
-        logger.info("memory shape %s", str(memory.shape))
+        encoded_embeddings = self.encoder(embeddings)
+        logger.info("encoded_embeddings shape %s", str(encoded_embeddings.shape))
 
         # Decode the queries in the latent space
-        output = self.decoder(queries, memory)
+        output = self.decoder(queries, encoded_embeddings)
         return output
 
 
@@ -278,7 +281,7 @@ class MultiheadAttention(nn.Module):
         self.bias_k = self.bias_v = None
         self.add_zero_attn = False
         self.out_proj = nn.Linear(embed_dim, embed_dim)
-        self.use_torch_impl = True
+        self.use_torch_impl = False
 
     def forward(
         self,
@@ -305,54 +308,68 @@ class MultiheadAttention(nn.Module):
         logger.debug("Query shape %s", str(query.shape))
         logger.debug("Key shape %s", str(key.shape))
         logger.debug("Value shape %s", str(value.shape))
-        if self.use_torch_impl:
-            attn_output, attn_output_weights = F.multi_head_attention_forward(
-                query,
-                key,
-                value,
-                self.embed_dim,
-                self.num_heads,
-                self.in_proj_weight,
-                self.in_proj_bias,
-                self.bias_k,
-                self.bias_v,
-                self.add_zero_attn,
-                self.dropout,
-                self.out_proj.weight,
-                self.out_proj.bias,
-                training=self.training,
-                key_padding_mask=None,
-                need_weights=need_weights,
-                attn_mask=None,
-                use_separate_proj_weight=False,
-                q_proj_weight=None,
-                k_proj_weight=None,
-                v_proj_weight=None,
-                average_attn_weights=True,
-            )
-            return attn_output, attn_output_weights
-        tgt_len, bsz, embed_dim = query.shape
+        # if self.use_torch_impl:
+        #     attn_output, attn_output_weights = F.multi_head_attention_forward(
+        #         query,
+        #         key,
+        #         value,
+        #         self.embed_dim,
+        #         self.num_heads,
+        #         self.in_proj_weight,
+        #         self.in_proj_bias,
+        #         self.bias_k,
+        #         self.bias_v,
+        #         self.add_zero_attn,
+        #         self.dropout,
+        #         self.out_proj.weight,
+        #         self.out_proj.bias,
+        #         training=self.training,
+        #         key_padding_mask=None,
+        #         need_weights=need_weights,
+        #         attn_mask=None,
+        #         use_separate_proj_weight=False,
+        #         q_proj_weight=None,
+        #         k_proj_weight=None,
+        #         v_proj_weight=None,
+        #         average_attn_weights=True,
+        #     )
+        #     return attn_output, attn_output_weights
 
-        # reshape q, k, v for multihead attention and make em batch first
-        query = (
-            query.contiguous()
+        # Query, Key and Value are batched
+        assert query.dim() == 3 and key.dim() == 3 and value.dim() == 3
+
+        tgt_len, bsz, embed_dim = query.shape
+        src_len, _, _ = key.shape
+
+        self.head_dim = embed_dim // self.num_heads
+
+        assert (
+            key.shape == value.shape
+        ), f"key shape {key.shape} does not match value shape {value.shape}"
+
+        # compute in-projection
+        q, k, v = self._in_projection_packed(
+            query, key, value, self.in_proj_weight, self.in_proj_bias
+        )
+
+        # reshape q, k, v for multihead attention and make embedding dim batch first
+        q = (
+            q.contiguous()
             .view(tgt_len, bsz * self.num_heads, self.head_dim)
             .transpose(0, 1)
         )
-        key = (
-            key.contiguous()
+        k = (
+            k.contiguous()
             .view(key.shape[0], bsz * self.num_heads, self.head_dim)
             .transpose(0, 1)
         )
-        value = (
-            value.contiguous()
+        v = (
+            v.contiguous()
             .view(value.shape[0], bsz * self.num_heads, self.head_dim)
             .transpose(0, 1)
         )
 
-        attn_output, attn_output_weights = self._scaled_dot_product_attention(
-            query, key, value
-        )
+        attn_output, attn_output_weights = self._scaled_dot_product_attention(q, k, v)
         attn_output = (
             attn_output.transpose(0, 1).contiguous().view(tgt_len * bsz, embed_dim)
         )
@@ -372,8 +389,8 @@ class MultiheadAttention(nn.Module):
     def _scaled_dot_product_attention(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        B, Nt, E = q.shape
-        q = q / math.sqrt(E)
+        _, _, embedding_dim = q.shape  # Batch, Nt, embedding dim
+        q = q / math.sqrt(embedding_dim)
         # (B, Nt, E) x (B, E, Ns) -> (B, Nt, Ns)
         attn = torch.bmm(q, k.transpose(-2, -1))
         attn = F.softmax(attn, dim=-1)
@@ -382,6 +399,37 @@ class MultiheadAttention(nn.Module):
         # (B, Nt, Ns) x (B, Ns, E) -> (B, Nt, E)
         output = torch.bmm(attn, v)
         return output, attn
+
+    def _in_projection_packed(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        w: torch.Tensor,
+        b: Optional[torch.Tensor] = None,
+    ) -> List[torch.Tensor]:
+        embedding_dim = q.size(-1)  # E is embedding dim
+        if k is v:
+            if q is k:
+                # self-attention
+                return F.linear(q, w, b).chunk(3, dim=-1)
+            else:
+                # encoder-decoder attention
+                w_q, w_kv = w.split([embedding_dim, embedding_dim * 2])
+                if b is None:
+                    b_q = b_kv = None
+                else:
+                    b_q, b_kv = b.split([embedding_dim, embedding_dim * 2])
+                return (F.linear(q, w_q, b_q),) + F.linear(k, w_kv, b_kv).chunk(
+                    2, dim=-1
+                )
+        else:
+            w_q, w_k, w_v = w.chunk(3)
+            if b is None:
+                b_q = b_k = b_v = None
+            else:
+                b_q, b_k, b_v = b.chunk(3)
+            return [F.linear(q, w_q, b_q), F.linear(k, w_k, b_k), F.linear(v, w_v, b_v)]
 
 
 class TransformerEncoderLayer(nn.Module):
