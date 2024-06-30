@@ -6,8 +6,8 @@ import torch
 import torchvision.transforms as T
 from rich.logging import RichHandler
 
-from utils import Boxes, map_official_weights, visualize, get_image_from_url
-from model import SimpleDETR, Predictions
+from simple_detr.utils import Boxes, map_official_weights, visualize, get_image_from_url
+from simple_detr.model import SimpleDETR, Predictions
 
 torch.set_grad_enabled(False)
 
@@ -37,11 +37,20 @@ class Detector:
         self.detr.eval()
         self.threshold = threshold
 
-    def detect_and_visualize(self, image: Image.Image) -> None:
-        """Detect object and visualize."""
+    def preprocess(self, image_rgb: Image.Image) -> torch.Tensor:
+        """Preprocess image and convert to tensor
 
+        Args:
+            image_rgb (Image.Image): RGB image object
+
+        Returns:
+            torch.Tensor: normalized image tensor.
+        """
         # mean-std normalize the input image (batch-size: 1)
-        img = self.transform(image).unsqueeze(0)
+        return self.transform(image_rgb).unsqueeze(0)
+
+    def detect(self, img: torch.Tensor) -> Boxes:
+        """Detect object and visualize."""
 
         # demo model only support by default images with aspect ratio between 0.5 and 2
         # if you want to use images with an aspect ratio outside this range
@@ -58,8 +67,16 @@ class Detector:
         keep = probas.max(-1).values > self.threshold
 
         boxes = Boxes(loc=outputs.boxes[0, keep], scores=probas[keep])
-        boxes.rescale(image.size)
+        return boxes
 
+    def visualize(self, image: Image.Image, boxes: Boxes) -> None:
+        """Visualize boxes on image
+
+        Args:
+            image (Image.Image): RGB images.
+            boxes (Boxes): box predictions.
+        """
+        boxes.rescale(image.size)
         visualize(image, boxes)
 
 
@@ -75,14 +92,13 @@ if __name__ == "__main__":
 
     detector = Detector()
 
-    # url = 'http://images.cocodataset.org/val2017/000000039769.jpg'
-    # url = "https://media.wired.com/photos/593256b42a990b06268a9e21/master/pass/traffic-jam-getty.jpg"
-    # url = "https://mcity.umich.edu/wp-content/uploads/2024/02/Birmingham-Intersection.jpg"
-
     query_image = get_image_from_url(
-        "https://media.wired.com/photos/593256b42a990b06268a9e21/master/pass/traffic-jam-getty.jpg"
+        url="https://media.wired.com/photos/593256b42a990b06268a9e21/master/pass/traffic-jam-getty.jpg"
+        # url="http://images.cocodataset.org/val2017/000000039769.jpg"
     )
     try:
-        detector.detect_and_visualize(query_image)
+        input_tensor = detector.preprocess(query_image)
+        predictions = detector.detect(input_tensor)
+        detector.visualize(query_image, predictions)
     except Exception as ex:
         logger.exception(ex)
