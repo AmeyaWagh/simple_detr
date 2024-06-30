@@ -1,3 +1,7 @@
 # simple_detr
 
-Implementing DETR in pure pytorch without using any transformers APIs.
+Simplified Implementation of DETR in pure pytorch without using any transformers APIs.
+
+
+Reference: https://arxiv.org/pdf/2005.12872
+

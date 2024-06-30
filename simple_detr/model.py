@@ -38,6 +38,7 @@ class SimpleDETR(nn.Module):
         image_feature_dim: int = 2048,
         max_image_dimensions: Tuple[int, int] = (50, 50),
         num_object_queries: int = 100,
+        backbone=resnet50(),
     ):
         """Create a simple detection transformer.
 
@@ -55,7 +56,7 @@ class SimpleDETR(nn.Module):
         super().__init__()
 
         # create ResNet-50 backbone
-        self.backbone = resnet50()
+        self.backbone = backbone
         del self.backbone.fc
 
         # 1x1 convolution to reduce the high-level activation map C to a smaller dimension d
