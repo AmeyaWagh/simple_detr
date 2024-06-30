@@ -8,7 +8,6 @@ import torch
 import matplotlib.pyplot as plt
 from PIL import Image
 
-from model import Predictions, SimpleDETR
 
 pp = pprint.PrettyPrinter(indent=4)
 
@@ -165,17 +164,17 @@ def visualize(pil_img, boxes_: Boxes):
     plt.show()
 
 
-def map_weights(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+def map_official_weights(state_dict: Dict[str, Any]) -> Dict[str, Any]:
     """Map the model's original weights to the new definition."""
-    # pp.pprint(list(state_dict.keys()))
     new_state_dict = {}
     for k, v in state_dict.items():
-        if "transformer.encoder" in k:
-            new_state_dict[k] = v
-        if "transformer.decoder" in k:
-            new_state_dict[k] = v
-        # if "transformer" in k:
-        #     k = f"transformer.{k}"
+
+        if "transformer.decoder.layers" in k:
+            new_k = k.replace("linear", "ffn.linear")
+            k = new_k
+        if "transformer.encoder.layers" in k:
+            new_k = k.replace("linear", "ffn.linear")
+            k = new_k
         new_state_dict[k] = v
     return new_state_dict
 

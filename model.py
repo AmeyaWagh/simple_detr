@@ -14,7 +14,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Predictions:
-    """Dataclass for managing predictions."""
+    """Dataclass for managing predictions.
+
+    Args:
+        logits (torch.Tensor): class logits of the predicted boxes
+        boxes (torch.Tensor): vector of box dimensions <x,y,width,height> along column.
+    """
 
     logits: torch.Tensor
     boxes: torch.Tensor
@@ -68,6 +73,7 @@ class SimpleDETR(nn.Module):
 
         # output positional encodings (object queries)
         self.num_object_queries = num_object_queries
+        # queries of the share (Q,D)
         self.query_pos = nn.Parameter(torch.rand(self.num_object_queries, hidden_dim))
 
         # spatial positional encodings
@@ -130,7 +136,7 @@ class SimpleDETR(nn.Module):
         """Detect objects in the image.
 
         Args:
-            image (torch.Tensor): image tensor of shape (B,C,H,W)
+            image (torch.Tensor): image tensor of shape (B,3,H,W)
 
         Returns:
             Predictions: prediction with boxes and logits
@@ -145,7 +151,7 @@ class SimpleDETR(nn.Module):
         positional_encoding = self._positional_encoding(image_features.shape[-2:])
         logger.info("positional encoding shape: %s", str(positional_encoding.shape))
 
-        # flatten image feature map from B,C,fH,fW -> C,B,fH*fW
+        # flatten image feature map from B,C,fH,fW -> fH*fW,B,C
         image_features = image_features.flatten(2).permute(2, 0, 1)
         embeddings = positional_encoding + 0.1 * image_features
 
@@ -153,7 +159,7 @@ class SimpleDETR(nn.Module):
 
         # propagate through the transformer
         outputs = self.transformer(embeddings, self.query_pos.unsqueeze(1))
-        outputs = outputs.transpose(0, 1)
+        outputs = outputs.transpose(0, 1)  # (B,Q,D)
 
         # finally project transformer outputs to class labels and bounding boxes
         logits = self.linear_class(outputs)
@@ -195,13 +201,12 @@ class SimpleEncoderDecoderTransformer(nn.Module):
         """Predict output for queries given embeddings.
 
         Args:
-            embeddings (torch.Tensor): embedding representation
-            queries (torch.Tensor): queries of objects.
+            embeddings (torch.Tensor): embedding representation, (fH*fW,B,C)
+            queries (torch.Tensor): queries of objects.(Q,1,D)
 
         Returns:
-            torch.Tensor: values associated with the object queries.
+            torch.Tensor: values associated with the object queries. (Q,B,D)
         """
-
         # Encode the embedding in latent space using Transformer encoder.
         encoded_embeddings = self.encoder(embeddings)
         logger.info("encoded_embeddings shape %s", str(encoded_embeddings.shape))
@@ -248,10 +253,10 @@ class TransformerEncoder(nn.Module):
         """encodes the given input using a transformer.
 
         Args:
-            x (torch.Tensor): input features.
+            x (torch.Tensor): input features. (fH*fW,B,C)
 
         Returns:
-            torch.Tensor: encoded embeddings.
+            torch.Tensor: encoded embeddings. (fH*fW,B,C)
         """
         for layer in self.layers:
             x = layer(x)
@@ -295,11 +300,11 @@ class TransformerDecoder(nn.Module):
         """Decode the query values from the encoded embeddings.
 
         Args:
-            q (torch.Tensor): query vectors
-            encoded_embeddings (torch.Tensor): encoded embeddings.
+            q (torch.Tensor): query vectors, (Q,1,D)
+            encoded_embeddings (torch.Tensor): encoded embeddings. (fH*fW,B,C)
 
         Returns:
-            torch.Tensor: decoded values for the queries.
+            torch.Tensor: decoded values for the queries. (Q,B,D)
         """
         x: torch.Tensor = q
         for layer in self.layers:
@@ -330,49 +335,38 @@ class TransformerEncoderLayer(nn.Module):
         super().__init__()
         self.self_attn = MultiheadAttention(hidden_dim, num_heads, dropout=dropout)
 
-        # Implementation of Feedforward model
-        self.linear1 = nn.Linear(hidden_dim, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, hidden_dim)
-
         self.norm1 = LayerNorm(hidden_dim, eps=layer_norm_eps)
         self.norm2 = LayerNorm(hidden_dim, eps=layer_norm_eps)
         self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
         self.activation = F.relu
+        self.ffn = FeedForwardNetwork(
+            hidden_dim=hidden_dim, dim_feedforward=dim_feedforward, dropout=dropout
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Encode the features using self attention and FFN.
 
         Args:
-            x (torch.Tensor): features to encode.
+            x (torch.Tensor): features to encode. (fH*fW,B,C)
 
         Returns:
-            torch.Tensor: encoded features.
+            torch.Tensor: encoded features. (fH*fW,B,C)
         """
         x = self.norm1(x + self._self_attention_block(x))
-        x = self.norm2(x + self._feedforward_block(x))
+        x = self.norm2(x + self.ffn(x))
         return x
 
     def _self_attention_block(
         self,
-        x: torch.Tensor,
+        q: torch.Tensor,
     ) -> torch.Tensor:
         x = self.self_attn(
-            query=x,
-            key=x,
-            value=x,
+            query=q,
+            key=q,
+            value=q,
             need_weights=False,
         )[0]
         return self.dropout1(x)
-
-    def _feedforward_block(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.linear1(x)
-        x = self.activation(x)
-        x = self.dropout(x)
-        x = self.linear2(x)
-        x = self.dropout2(x)
-        return self.dropout2(x)
 
 
 class TransformerDecoderLayer(nn.Module):
@@ -399,61 +393,56 @@ class TransformerDecoderLayer(nn.Module):
         self.self_attn = MultiheadAttention(hidden_dim, num_heads, dropout=dropout)
         self.multihead_attn = MultiheadAttention(hidden_dim, num_heads, dropout=dropout)
 
-        # Implementation of Feedforward model
-        self.linear1 = nn.Linear(hidden_dim, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, hidden_dim)
-
         self.norm1 = LayerNorm(hidden_dim, eps=layer_norm_eps)
         self.norm2 = LayerNorm(hidden_dim, eps=layer_norm_eps)
         self.norm3 = LayerNorm(hidden_dim, eps=layer_norm_eps)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
-        self.dropout3 = nn.Dropout(dropout)
         self.activation = F.relu
+        self.ffn = FeedForwardNetwork(
+            hidden_dim=hidden_dim, dim_feedforward=dim_feedforward, dropout=dropout
+        )
 
-    def forward(self, x: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, embeddings: torch.Tensor) -> torch.Tensor:
+        """Performs foward pass of transformer layer.
+
+        Args:
+            x (torch.Tensor): input tensor. (Q,1,D)
+            embeddings (torch.Tensor): encoded embeddings. (fH*fW,B,C)
+
+        Returns:
+            torch.Tensor: output of the transformer decoder. (Q,B,D)
+        """
         x = self.norm1(x + self._self_attention_block(x))
-        x = self.norm2(x + self._multi_head_attention_block(x, memory))
-        x = self.norm3(x + self._feedforward_block(x))
+        x = self.norm2(x + self._multi_head_attention_block(x, embeddings))
+        x = self.norm3(x + self.ffn(x))
 
         return x
 
-    # self-attention block
     def _self_attention_block(
         self,
-        x: torch.Tensor,
+        q: torch.Tensor,
     ) -> torch.Tensor:
         x = self.self_attn(
-            query=x,
-            key=x,
-            value=x,
+            query=q,
+            key=q,
+            value=q,
             need_weights=False,
         )[0]
         return self.dropout1(x)
 
-    # multihead attention block
     def _multi_head_attention_block(
         self,
-        x: torch.Tensor,
-        memory: torch.Tensor,
+        q: torch.Tensor,
+        kv: torch.Tensor,
     ) -> torch.Tensor:
         x = self.multihead_attn(
-            x,
-            memory,
-            memory,
+            q,
+            kv,
+            kv,
             need_weights=False,
         )[0]
         return self.dropout2(x)
-
-    # feed forward block
-    def _feedforward_block(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.linear1(x)
-        x = self.activation(x)
-        x = self.dropout(x)
-        x = self.linear2(x)
-        x = self.dropout3(x)
-        return x
 
 
 class MultiheadAttention(nn.Module):
@@ -667,3 +656,33 @@ class LayerNorm(nn.Module):
             nn.init.ones_(self.weight)
             if self.bias is not None:
                 nn.init.zeros_(self.bias)
+
+
+class FeedForwardNetwork(nn.Module):
+    """Implementation of Feed Forward Network"""
+
+    def __init__(
+        self, hidden_dim: int, dim_feedforward: int, dropout: float = 0.1
+    ) -> None:
+        super().__init__()
+        self.linear1 = nn.Linear(hidden_dim, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, hidden_dim)
+        self.activation = F.relu
+        self.dropout3 = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Perform feed forward network forward pass.
+
+        Args:
+            x (torch.Tensor): input tensor
+
+        Returns:
+            torch.Tensor: output of the FFN.
+        """
+        x = self.linear1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        x = self.linear2(x)
+        x = self.dropout3(x)
+        return x

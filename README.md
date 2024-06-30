@@ -1,2 +1,3 @@
 # simple_detr
-A simple implementation of Detr
+
+Implementing DETR in pure pytorch without using any transformers APIs.

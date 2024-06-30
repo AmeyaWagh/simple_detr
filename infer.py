@@ -4,12 +4,12 @@ from typing import Callable
 from PIL import Image
 import torch
 import torchvision.transforms as T
+from rich.logging import RichHandler
 
-from utils import Boxes, map_weights, visualize, get_image_from_url
+from utils import Boxes, map_official_weights, visualize, get_image_from_url
 from model import SimpleDETR, Predictions
 
 torch.set_grad_enabled(False)
-logger = logging.getLogger("main")
 
 
 class Detector:
@@ -31,7 +31,7 @@ class Detector:
             check_hash=True,
         )
 
-        state_dict = map_weights(state_dict)
+        state_dict = map_official_weights(state_dict)
         self.detr.load_state_dict(state_dict)
         self.detr.to("cpu")
         self.detr.eval()
@@ -64,7 +64,13 @@ class Detector:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        datefmt="[%X]",
+        handlers=[RichHandler(rich_tracebacks=True)],
+    )
+    logger = logging.getLogger("main")
     logger.info("Object detection")
 
     detector = Detector()
@@ -76,5 +82,7 @@ if __name__ == "__main__":
     query_image = get_image_from_url(
         "https://media.wired.com/photos/593256b42a990b06268a9e21/master/pass/traffic-jam-getty.jpg"
     )
-
-    detector.detect_and_visualize(query_image)
+    try:
+        detector.detect_and_visualize(query_image)
+    except Exception as ex:
+        logger.exception(ex)
