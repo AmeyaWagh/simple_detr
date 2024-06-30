@@ -55,9 +55,8 @@ class SimpleDETR(nn.Module):
 
         super().__init__()
 
-        # create ResNet-50 backbone
-        self.backbone = backbone
-        del self.backbone.fc
+        # Resnet backbone
+        self.backbone = ImageEncoderBackbone(backbone=backbone)
 
         # 1x1 convolution to reduce the high-level activation map C to a smaller dimension d
         self.conv = nn.Conv2d(image_feature_dim, hidden_dim, 1)
@@ -77,38 +76,14 @@ class SimpleDETR(nn.Module):
         # queries of the share (Q,D)
         self.query_pos = nn.Parameter(torch.rand(self.num_object_queries, hidden_dim))
 
-        # spatial positional encodings
-        # NOTE In baseline DETR we use sine positional encodings
+        # Spatial positional encodings
+        # NOTE In baseline DETR sine positional encodings is used.
         self.row_embed = nn.Parameter(
             torch.rand(max_image_dimensions[0], hidden_dim // 2)
         )
         self.col_embed = nn.Parameter(
             torch.rand(max_image_dimensions[1], hidden_dim // 2)
         )
-
-    def _image_encoder_forward(self, image: torch.Tensor) -> torch.Tensor:
-        """Propagae image through Resnet-50 backbone.
-
-        Args:
-            image (torch.Tensor): image tensor of shape B,3,H,W
-
-        Returns:
-            torch.Tensor: image features output shape B,C,fH,fW where fH = H/32, fW = W/32
-        """
-        # inputs shape B,3,H,W
-        x = self.backbone.conv1(image)
-        x = self.backbone.bn1(x)
-        x = self.backbone.relu(x)
-        x = self.backbone.maxpool(x)
-
-        x = self.backbone.layer1(x)
-        x = self.backbone.layer2(x)
-        x = self.backbone.layer3(x)
-        x = self.backbone.layer4(x)
-
-        # convert from 2048 to 256 feature planes for the transformer
-        x = self.conv(x)
-        return x  # output shape B,C,fH,fW
 
     def _positional_encoding(self, feature_shape: Tuple[int, int]) -> torch.Tensor:
         """Creates positional encoding tensor for the given feature map shape.
@@ -144,7 +119,9 @@ class SimpleDETR(nn.Module):
         """
         logger.info("image shape:%s", str(image.shape))
 
-        image_features = self._image_encoder_forward(image)
+        feat = self.backbone(image)
+        # convert from 2048 to 256 feature planes for the transformer
+        image_features = self.conv(feat)
 
         logger.info("Image feature shape %s", str(image_features.shape))
 
@@ -166,6 +143,43 @@ class SimpleDETR(nn.Module):
         logits = self.linear_class(outputs)
         boxes = self.linear_bbox(outputs).sigmoid()
         return Predictions(logits=logits, boxes=boxes)
+
+
+class ImageEncoderBackbone(nn.Module):
+    """Resnet Image Encoder Backbone."""
+
+    def __init__(self, backbone=resnet50()) -> None:
+        super().__init__()
+        self.conv1 = backbone.conv1
+        self.bn1 = backbone.bn1
+        self.relu = backbone.relu
+        self.maxpool = backbone.maxpool
+
+        self.layer1 = backbone.layer1
+        self.layer2 = backbone.layer2
+        self.layer3 = backbone.layer3
+        self.layer4 = backbone.layer4
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        """Resnet forward pass.
+
+        Args:
+            image (torch.Tensor): B,3,H,W
+
+        Returns:
+            torch.Tensor: image features output shape B,C,fH,fW where fH = H/32, fW = W/32
+        """
+        x = self.conv1(image)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        return x
 
 
 class SimpleEncoderDecoderTransformer(nn.Module):
