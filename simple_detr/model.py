@@ -72,8 +72,8 @@ class SimpleDETR(nn.Module):
         self.linear_bbox = nn.Linear(hidden_dim, 4)
 
         # output positional encodings (object queries)
-        self.num_object_queries = num_object_queries
-        # queries of the share (Q,D)
+        self.num_object_queries = num_object_queries  # Q- number of queries.
+        # queries of the share (Q,D) where Q is number of queries and D is hidden dimensions.
         self.query_pos = nn.Parameter(torch.rand(self.num_object_queries, hidden_dim))
 
         # Spatial positional encodings
@@ -95,6 +95,7 @@ class SimpleDETR(nn.Module):
             torch.Tensor: positional encoding for each pixel in the image feature map.
         """
         feat_height, feat_width = feature_shape
+        # Create a grid with the sinusoidal position values.
         pos = (
             torch.cat(
                 [
@@ -119,29 +120,32 @@ class SimpleDETR(nn.Module):
         """
         logger.info("image shape:%s", str(image.shape))
 
+        # Pass the image throught the image encoder to get image features.
         feat = self.backbone(image)
-        # convert from 2048 to 256 feature planes for the transformer
+        # Convert from image features from 2048 to 256 feature planes for the transformer
         image_features = self.conv(feat)
 
         logger.info("Image feature shape %s", str(image_features.shape))
 
-        # construct positional encodings for each pixel in the image feature map.
+        # Construct positional encodings for each pixel in the image feature map.
         positional_encoding = self._positional_encoding(image_features.shape[-2:])
         logger.info("positional encoding shape: %s", str(positional_encoding.shape))
 
-        # flatten image feature map from B,C,fH,fW -> fH*fW,B,C
+        # Flatten image feature map from B,C,fH,fW -> fH*fW,B,C
         image_features = image_features.flatten(2).permute(2, 0, 1)
+
+        # Add positional embeddings with scaled image features.
         embeddings = positional_encoding + 0.1 * image_features
 
         logger.info("embedding shape %s", str(embeddings.shape))
 
-        # propagate through the transformer
-        outputs = self.transformer(embeddings, self.query_pos.unsqueeze(1))
-        outputs = outputs.transpose(0, 1)  # (B,Q,D)
+        # Propagate the queries and image embeddings through the transformer to get object features.
+        object_features = self.transformer(embeddings, self.query_pos.unsqueeze(1))
+        object_features = object_features.transpose(0, 1)  # (B,Q,D)
 
-        # finally project transformer outputs to class labels and bounding boxes
-        logits = self.linear_class(outputs)
-        boxes = self.linear_bbox(outputs).sigmoid()
+        # finally project transformer object_feature maps to class labels and bounding boxes
+        logits = self.linear_class(object_features)
+        boxes = self.linear_bbox(object_features).sigmoid()
         return Predictions(logits=logits, boxes=boxes)
 
 
@@ -265,7 +269,7 @@ class TransformerEncoder(nn.Module):
         self.norm = LayerNorm(num_hidden_dims)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """encodes the given input using a transformer.
+        """Encodes the given input using a transformer.
 
         Args:
             x (torch.Tensor): input features. (fH*fW,B,C)
@@ -531,7 +535,7 @@ class MultiheadAttention(nn.Module):
         # Query, Key and Value are batched
         assert query.dim() == 3 and key.dim() == 3 and value.dim() == 3
 
-        tgt_len, bsz, embed_dim = query.shape
+        num_queries, batch_size, embed_dim = query.shape
         src_len, _, _ = key.shape
 
         self.head_dim = embed_dim // self.num_heads
@@ -541,37 +545,42 @@ class MultiheadAttention(nn.Module):
         ), f"key shape {key.shape} does not match value shape {value.shape}"
 
         # compute in-projection
-        q, k, v = self._in_projection_packed(
-            query, key, value, self.in_proj_weight, self.in_proj_bias
-        )
+        q, k, v = self._input_projection_packed(query, key, value)
 
-        # reshape q, k, v for multihead attention and make embedding dim batch first
+        # Reshape q, k, v for multihead attention by splitting it in base on number of heads
+        # and make embedding dim batch first
         q = (
             q.contiguous()
-            .view(tgt_len, bsz * self.num_heads, self.head_dim)
+            .view(num_queries, batch_size * self.num_heads, self.head_dim)
             .transpose(0, 1)
         )
         k = (
             k.contiguous()
-            .view(key.shape[0], bsz * self.num_heads, self.head_dim)
+            .view(key.shape[0], batch_size * self.num_heads, self.head_dim)
             .transpose(0, 1)
         )
         v = (
             v.contiguous()
-            .view(value.shape[0], bsz * self.num_heads, self.head_dim)
+            .view(value.shape[0], batch_size * self.num_heads, self.head_dim)
             .transpose(0, 1)
         )
 
         attn_output, attn_output_weights = self._scaled_dot_product_attention(q, k, v)
+
         attn_output = (
-            attn_output.transpose(0, 1).contiguous().view(tgt_len * bsz, embed_dim)
+            attn_output.transpose(0, 1)
+            .contiguous()
+            .view(num_queries * batch_size, embed_dim)
         )
-        attn_output = F.linear(attn_output, self.out_proj.weight, self.out_proj.bias)
-        attn_output = attn_output.view(tgt_len, bsz, attn_output.size(1))
+
+        attn_output = self._output_projection(attn_output)
+
+        attn_output = attn_output.view(num_queries, batch_size, attn_output.size(1))
+
         if need_weights:
             src_len = key.size(1)
             attn_output_weights = attn_output_weights.view(
-                bsz, self.num_heads, tgt_len, src_len
+                batch_size, self.num_heads, num_queries, src_len
             )
             attn_output_weights = attn_output_weights.sum(dim=1) / self.num_heads
             attn_output = attn_output.squeeze(1)
@@ -582,51 +591,80 @@ class MultiheadAttention(nn.Module):
     def _scaled_dot_product_attention(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The actual transformer equation.
+
+        .. math::
+            \text{Attention}(Q, K, V) = \text{softmax}(\frac{QK^T}{\sqrt{d_k}})V
+        Args:
+            q (torch.Tensor): query tensor
+            k (torch.Tensor): key tensor
+            v (torch.Tensor): value tensor
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: result of the scaled dot product attention.
+        """
         embedding_dim = q.size(-1)
+        # Normalize the query.
         q = q / math.sqrt(embedding_dim)
-        # (B, Nt, E) x (B, E, Ns) -> (B, Nt, Ns)
+
+        # Perform dot product between Query and Key.
+        # (B, Q, E) x (B, E, Nk) -> (B, Q, Nk)
         attn = torch.bmm(q, k.transpose(-2, -1))
+
+        # Perform softmax of the obtained attention.
         attn = F.softmax(attn, dim=-1)
         if self.dropout > 0.0:
             attn = F.dropout(attn, p=self.dropout)
-        # (B, Nt, Ns) x (B, Ns, E) -> (B, Nt, E)
+
+        # Multiply the attention with the value tensor to get the scaled dot product attention.
+        # (B, Q, Nk) x (B, Nq, E) -> (B, Q, E)
         output = torch.bmm(attn, v)
         return output, attn
 
-    def _in_projection_packed(
+    def _input_projection_packed(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        w: torch.Tensor,
-        b: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
+        """Project Query, Key, Value using linear transform.
+
+        Args:
+            q (torch.Tensor): Query tensor.
+            k (torch.Tensor): Key tensor.
+            v (torch.Tensor): Value tensor.
+
+        Returns:
+            List[torch.Tensor]: _description_
+        """
+
         embedding_dim = q.size(-1)  # E is embedding dim
-        if k is v:
-            if q is k:
-                # self-attention
-                q_, k_, v_ = F.linear(q, w, b).chunk(3, dim=-1)
-                return [q_, k_, v_]
-            else:
-                # encoder-decoder attention
-                w_q, w_kv = w.split([embedding_dim, embedding_dim * 2])
-                if b is None:
-                    b_q = b_kv = None
-                else:
-                    b_q, b_kv = b.split([embedding_dim, embedding_dim * 2])
-                q_ = F.linear(q, w_q, b_q)
-                k_, v_ = F.linear(k, w_kv, b_kv).chunk(2, dim=-1)
-                return [q_, k_, v_]
-        else:
-            w_q, w_k, w_v = w.chunk(3)
-            if b is None:
-                b_q = b_k = b_v = None
-            else:
-                b_q, b_k, b_v = b.chunk(3)
-            q_ = F.linear(q, w_q, b_q)
-            k_ = F.linear(k, w_k, b_k)
-            v_ = F.linear(v, w_v, b_v)
+        assert k is v
+        w = self.in_proj_weight
+        b = self.in_proj_bias
+        if q is k:  # self-attention
+            q_, k_, v_ = F.linear(q, w, b).chunk(3, dim=-1)
             return [q_, k_, v_]
+        else:  # Cross attention
+            w_q, w_kv = w.split([embedding_dim, embedding_dim * 2])
+            if b is None:
+                b_q = b_kv = None
+            else:
+                b_q, b_kv = b.split([embedding_dim, embedding_dim * 2])
+            q_ = F.linear(q, w_q, b_q)
+            k_, v_ = F.linear(k, w_kv, b_kv).chunk(2, dim=-1)
+            return [q_, k_, v_]
+
+    def _output_projection(self, attn_output: torch.Tensor) -> torch.Tensor:
+        """Project attention output using linear transform.
+
+        Args:
+            attn_output (torch.Tensor): attention output (Q,B,E)
+
+        Returns:
+            torch.Tensor: projected output (Q,B,E)
+        """
+        return F.linear(attn_output, self.out_proj.weight, self.out_proj.bias)
 
 
 class LayerNorm(nn.Module):
