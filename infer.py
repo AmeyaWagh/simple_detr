@@ -15,7 +15,8 @@ torch.set_grad_enabled(False)
 class Detector:
     """2D Object detector."""
 
-    def __init__(self, threshold: float = 0.7) -> None:
+    def __init__(self, threshold: float = 0.7, device: str = "cpu") -> None:
+        self.device = device
         self.transform: Callable[[Image.Image], torch.Tensor] = T.Compose(
             [
                 T.Resize(800),
@@ -27,13 +28,12 @@ class Detector:
 
         state_dict = torch.hub.load_state_dict_from_url(
             url="https://dl.fbaipublicfiles.com/detr/detr_demo-da2a99e9.pth",
-            map_location="cpu",
+            map_location=self.device,
             check_hash=True,
         )
-
         state_dict = map_official_weights(state_dict)
         self.detr.load_state_dict(state_dict)
-        self.detr.to("cpu")
+        self.detr.to(self.device)
         self.detr.eval()
         self.threshold = threshold
 
@@ -59,14 +59,16 @@ class Detector:
             img.shape[-2] <= 1600 and img.shape[-1] <= 1600
         ), "demo model only supports images up to 1600 pixels on each side"
 
+        img_ = img.to(self.device)
+
         # propagate through the model
-        outputs: Predictions = self.detr(img)
+        outputs: Predictions = self.detr(img_)
 
         # keep only predictions with 0.7+ confidence
         probas = outputs.logits.softmax(-1)[0, :, :-1]
         keep = probas.max(-1).values > self.threshold
 
-        boxes = Boxes(loc=outputs.boxes[0, keep], scores=probas[keep])
+        boxes = Boxes(loc=outputs.boxes[0, keep].cpu(), scores=probas[keep].cpu())
         return boxes
 
     def visualize(self, image: Image.Image, boxes: Boxes) -> None:
@@ -90,7 +92,7 @@ if __name__ == "__main__":
     logger = logging.getLogger("main")
     logger.info("Object detection")
 
-    detector = Detector()
+    detector = Detector(device="cuda")
 
     query_image = get_image_from_url(
         url="https://media.wired.com/photos/593256b42a990b06268a9e21/master/pass/traffic-jam-getty.jpg"

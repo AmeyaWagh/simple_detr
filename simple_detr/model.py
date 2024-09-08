@@ -1,3 +1,5 @@
+"""Pure Pytorch implementation of DETR."""
+
 from typing import List, Optional, Tuple
 import math
 from dataclasses import dataclass
