@@ -19,6 +19,5 @@ DETR is an end-to-end object detection model that uses a transformer architectur
 - Original DETR paper: [End-to-End Object Detection with Transformers](https://arxiv.org/abs/2005.12872)
 
 
-
-
+This work is derived from https://github.com/facebookresearch/detr
 
